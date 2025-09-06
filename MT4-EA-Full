@@ -1,0 +1,244 @@
+//+------------------------------------------------------------------+
+//| SMC ICT Full Candle MT4 EA - Multi-Symbol                        |
+//+------------------------------------------------------------------+
+#property strict
+
+// Symbols and timeframes
+extern string Symbols[] = {"BTCUSD","XAUUSD","GBPJPY","EURUSD","US30"};
+extern int TrendTF = PERIOD_H1;
+extern int EntryTF = PERIOD_M15;
+extern int MicroTF = PERIOD_M5;
+
+// Risk & trade parameters
+extern double RiskPercent = 1.0;
+extern int MaxTradesPerSymbol = 2;
+
+// Session filter
+extern bool UseSessionFilter = true;
+extern int StartHour = 8;
+extern int EndHour   = 17;
+
+// Telegram
+extern string TelegramBotToken = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11";
+extern string TelegramChatID = "987654321";
+extern bool SendTelegramAlerts = true;
+
+// Logging
+extern string LogFileName = "SMC_ICT_TradeLog.csv";
+extern bool EnableLogging = true;
+
+//+------------------------------------------------------------------+
+int start()
+{
+   int hourNow = Hour();
+
+   for(int i=0;i<ArraySize(Symbols);i++)
+   {
+      string sym = Symbols[i];
+
+      // Session filter
+      if(UseSessionFilter && sym!="BTCUSD")
+         if(hourNow<StartHour || hourNow>EndHour) continue;
+
+      // Limit max trades
+      if(CountOpenTrades(sym)>=MaxTradesPerSymbol) continue;
+
+      // Trend detection H1
+      int trend = CheckMarketStructure(sym,TrendTF);
+
+      // ICT candle detection
+      double obLow, obHigh, fvgLow, fvgHigh, breakerLow, breakerHigh, sweepLevel;
+      if(!FindOrderBlock(sym,EntryTF,trend,obLow,obHigh)) continue;
+      if(!FindFairValueGap(sym,EntryTF,trend,fvgLow,fvgHigh)) continue;
+      if(!FindBreakerBlock(sym,EntryTF,trend,breakerLow,breakerHigh)) continue;
+      if(!FindLiquiditySweep(sym,MicroTF,trend,sweepLevel)) sweepLevel=0;
+
+      // Microstructure confirmation M5
+      bool entrySignal = CheckMicrostructure(sym,MicroTF,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,sweepLevel,trend);
+
+      if(entrySignal)
+      {
+         double sl = (trend==1)?obLow:obHigh;
+         double tp = (trend==1)?fvgHigh:fvgLow;
+         double lot = CalculateLotSize(sym,RiskPercent);
+
+         LogAndAlert(sym,trend,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,sl,tp,lot);
+
+         SendTrade(sym,trend,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,lot);
+      }
+   }
+
+   return(0);
+}
+
+//+------------------------------------------------------------------+
+// --- Core Functions --- //
+
+// Count open trades
+int CountOpenTrades(string sym)
+{
+   int count=0;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES))
+         if(OrderSymbol()==sym) count++;
+   }
+   return count;
+}
+
+// Trend detection H1
+int CheckMarketStructure(string sym,int tf)
+{
+   double high1=iHigh(sym,tf,1);
+   double high2=iHigh(sym,tf,2);
+   double low1=iLow(sym,tf,1);
+   double low2=iLow(sym,tf,2);
+   if(high1>high2 && low1>low2) return 1;
+   if(high1<high2 && low1<low2) return -1;
+   return 0;
+}
+
+// Order Block detection
+bool FindOrderBlock(string sym,int tf,int trend,double &obLow,double &obHigh)
+{
+   for(int i=2;i<10;i++)
+   {
+      double open=iOpen(sym,tf,i);
+      double close=iClose(sym,tf,i);
+      double high=iHigh(sym,tf,i);
+      double low=iLow(sym,tf,i);
+
+      if(trend==1 && close<open) { obLow=low; obHigh=high; return true; }
+      if(trend==-1 && close>open) { obLow=low; obHigh=high; return true; }
+   }
+   return false;
+}
+
+// Fair Value Gap detection
+bool FindFairValueGap(string sym,int tf,int trend,double &fvgLow,double &fvgHigh)
+{
+   for(int i=2;i<10;i++)
+   {
+      double high0=iHigh(sym,tf,i-2);
+      double low0=iLow(sym,tf,i-2);
+      double high2=iHigh(sym,tf,i);
+      double low2=iLow(sym,tf,i);
+
+      if(trend==1 && low0>high2) { fvgLow=high2; fvgHigh=low0; return true; }
+      if(trend==-1 && high0<low2) { fvgLow=high0; fvgHigh=low2; return true; }
+   }
+   return false;
+}
+
+// Breaker Block detection
+bool FindBreakerBlock(string sym,int tf,int trend,double &breakerLow,double &breakerHigh)
+{
+   for(int i=2;i<10;i++)
+   {
+      double open=iOpen(sym,tf,i);
+      double close=iClose(sym,tf,i);
+      double high=iHigh(sym,tf,i);
+      double low=iLow(sym,tf,i);
+
+      if(trend==1 && close>open) { breakerLow=low; breakerHigh=high; return true; }
+      if(trend==-1 && close<open) { breakerLow=low; breakerHigh=high; return true; }
+   }
+   return false;
+}
+
+// Liquidity Sweep detection
+bool FindLiquiditySweep(string sym,int tf,int trend,double &sweepLevel)
+{
+   double high=iHigh(sym,tf,1);
+   double low=iLow(sym,tf,1);
+   sweepLevel = (trend==1)?high:low;
+   return true;
+}
+
+// Microstructure confirmation
+bool CheckMicrostructure(string sym,int tf,double obLow,double obHigh,double fvgLow,double fvgHigh,double breakerLow,double breakerHigh,double sweepLevel,int trend)
+{
+   double close=iClose(sym,tf,0);
+   if(trend==1 && (close>=obLow || close>=fvgLow || close>=breakerLow || close>=sweepLevel)) return true;
+   if(trend==-1 && (close<=obHigh || close<=fvgHigh || close<=breakerHigh || close<=sweepLevel)) return true;
+   return false;
+}
+
+// Send trade
+void SendTrade(string sym,int trend,double obLow,double obHigh,double fvgLow,double fvgHigh,double breakerLow,double breakerHigh,double lot)
+{
+   double price = (trend==1)?Ask:Bid;
+   double sl    = (trend==1)?obLow:obHigh;
+   double tp    = (trend==1)?fvgHigh:fvgLow;
+
+   if(trend==1) OrderSend(sym,OP_BUY,lot,price,10,sl,tp,"SMC ICT Buy",0,0,clrBlue);
+   else          OrderSend(sym,OP_SELL,lot,price,10,sl,tp,"SMC ICT Sell",0,0,clrRed);
+}
+
+// Lot calculation
+double CalculateLotSize(string sym,double riskPercent)
+{
+   double balance=AccountBalance();
+   double risk=balance*riskPercent/100.0;
+   double tickValue=MarketInfo(sym,MODE_TICKVALUE);
+   double lot=risk/tickValue;
+   if(lot<0.01) lot=0.01;
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+// --- Logging + Telegram --- //
+
+void InitLogFile()
+{
+   if(!EnableLogging) return;
+   int handle=FileOpen(LogFileName,FILE_CSV|FILE_READ|FILE_WRITE);
+   if(handle<1)
+   {
+      handle=FileOpen(LogFileName,FILE_CSV|FILE_WRITE);
+      if(handle>0)
+      {
+         FileWrite(handle,"Timestamp","Symbol","Direction","OB_Low","OB_High","FVG_Low","FVG_High","Breaker_Low","Breaker_High","SL","TP","Lot","Result");
+         FileClose(handle);
+      }
+   }
+}
+
+void LogTrade(string symbol,int trend,double obLow,double obHigh,double fvgLow,double fvgHigh,double breakerLow,double breakerHigh,double sl,double tp,double lot,string result="")
+{
+   if(!EnableLogging) return;
+   int handle=FileOpen(LogFileName,FILE_CSV|FILE_READ|FILE_WRITE);
+   if(handle>0)
+   {
+      FileSeek(handle,0,SEEK_END);
+      string dir = (trend==1)?"BUY":"SELL";
+      FileWrite(handle,TimeToStr(TimeCurrent(),TIME_DATE|TIME_MINUTES),symbol,dir,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,sl,tp,lot,result);
+      FileClose(handle);
+   }
+}
+
+// Telegram alert
+void SendTelegramMessage(string message)
+{
+   if(!SendTelegramAlerts) return;
+   string url="https://api.telegram.org/bot"+TelegramBotToken+"/sendMessage?chat_id="+TelegramChatID+"&text="+message;
+   char result[];
+   WebRequest("GET",url,"","",0,result,NULL);
+}
+
+void AlertSignal(string symbol,int trend,double obLow,double obHigh,double fvgLow,double fvgHigh,double breakerLow,double breakerHigh,double sl,double tp)
+{
+   string dir = (trend==1)?"BUY":"SELL";
+   string msg="SMC ICT Signal: "+symbol+" "+dir+"\n";
+   msg+=StringFormat("OB: %.2f-%.2f, FVG: %.2f-%.2f, Breaker: %.2f-%.2f\n",obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh);
+   msg+=StringFormat("SL: %.2f, TP: %.2f",sl,tp);
+   Print(msg);
+   SendTelegramMessage(msg);
+}
+
+// Combined log + alert
+void LogAndAlert(string symbol,int trend,double obLow,double obHigh,double fvgLow,double fvgHigh,double breakerLow,double breakerHigh,double sl,double tp,double lot)
+{
+   AlertSignal(symbol,trend,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,sl,tp);
+   LogTrade(symbol,trend,obLow,obHigh,fvgLow,fvgHigh,breakerLow,breakerHigh,sl,tp,lot);
+}
